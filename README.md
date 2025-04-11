@@ -1,1 +1,1 @@
-# Wireless-Sequence-Detection-using-Deep-Q-Learning-DQN-
+# Wireless Sequence Detection using Deep Q Learning DQN
