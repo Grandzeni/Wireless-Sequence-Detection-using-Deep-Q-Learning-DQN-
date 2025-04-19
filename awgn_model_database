@@ -1,0 +1,28 @@
+import numpy as np
+
+def generate_wireless_dataset(num_samples=100, sequence_length=100, snr_db=10, filename="wireless_dataset.npz"):
+    clean_sequences = []
+    noisy_sequences = []
+
+    snr_linear = 10 ** (snr_db / 10)
+
+    for _ in range(num_samples):
+        # Generate random binary sequence (0s and 1s)
+        clean = np.random.randint(0, 2, sequence_length)
+        
+        # BPSK modulation: 0 → -1, 1 → +1
+        modulated = 2 * clean - 1
+
+        # AWGN noise
+        noise = np.random.normal(0, 1 / np.sqrt(snr_linear), sequence_length)
+        received = modulated + noise
+
+        clean_sequences.append(clean)
+        noisy_sequences.append(received)
+
+    # Save as NumPy arrays
+    np.savez(filename, clean=np.array(clean_sequences), noisy=np.array(noisy_sequences))
+    print(f"Dataset saved to '{filename}' with {num_samples} samples.")
+
+# Generate the dataset
+generate_wireless_dataset()
