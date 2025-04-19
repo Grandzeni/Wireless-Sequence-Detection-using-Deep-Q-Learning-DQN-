@@ -2,123 +2,236 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections import deque
+from sklearn.model_selection import train_test_split
 import random
 import matplotlib.pyplot as plt
 
+np.random.seed(42)
+torch.manual_seed(42)
 
-class WirelessSequenceEnv:
-    def __init__(self, sequence_length=5, snr_db=10):
-        self.sequence_length = sequence_length
-        self.snr_db = snr_db
-        self.snr_linear = 10 ** (snr_db / 10)
-        self.original_sequence = self.generate_sequence()
-        self.current_index = 0
-        self.noisy_sequence = self.add_noise(self.original_sequence)
+# ------------------------------
+# 1. Wireless Environment
+# ------------------------------
+class WirelessEnv:
+    def __init__(self, noisy_sequences, clean_sequences, window_size=5):
+        self.noisy_sequences = noisy_sequences
+        self.clean_sequences = clean_sequences
+        self.window_size = window_size
+        self.half_window = window_size // 2
+        self.current_seq = 0
+        self.current_pos = self.half_window
 
-    def generate_sequence(self):
-        return np.random.randint(0, 2, self.sequence_length)
+    def reset(self, seq_idx=None):
+        if seq_idx is None:
+            self.current_seq = np.random.randint(0, len(self.clean_sequences))
+        else:
+            self.current_seq = seq_idx
+        self.current_pos = self.half_window
+        return self._get_window()
 
-    def add_noise(self, sequence):
-        noise = np.random.normal(0, 1 / np.sqrt(self.snr_linear), self.sequence_length)
-        return 2 * sequence - 1 + noise  # BPSK: Map {0,1} → {-1,+1}
-
-    def reset(self):
-        self.original_sequence = self.generate_sequence()
-        self.noisy_sequence = self.add_noise(self.original_sequence)
-        self.current_index = 0
-        return self.noisy_sequence
+    def _get_window(self):
+        noisy = self.noisy_sequences[self.current_seq]
+        padded = np.pad(noisy, (self.half_window, self.half_window), mode='constant')
+        return padded[self.current_pos:self.current_pos + self.window_size]
 
     def step(self, action):
-        correct_symbol = self.original_sequence[self.current_index]
-        reward = 1 if action == correct_symbol else -1
-        self.current_index += 1
-        done = self.current_index == self.sequence_length
-        return self.noisy_sequence, reward, done
+        true_bit = self.clean_sequences[self.current_seq][self.current_pos - self.half_window]
+        reward = 1 if action == true_bit else -1
+        self.current_pos += 1
+        done = self.current_pos >= len(self.clean_sequences[self.current_seq]) + self.half_window - 1
+        return self._get_window(), reward, done, true_bit
 
-# Define the Deep Q-Network (DQN)
-class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, output_dim)
-    
+# ------------------------------
+# 2. SBRNN Model
+# ------------------------------
+class SBRNN(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=32, output_dim=2, window_size=5):
+        super(SBRNN, self).__init__()
+        self.window_size = window_size
+        self.rnn = nn.GRU(input_dim, hidden_dim, bidirectional=True, batch_first=True)
+        self.fc = nn.Linear(2 * hidden_dim, output_dim)
+
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return self.fc3(x)
+        x = x.unsqueeze(-1)  # Add channel dimension
+        out, _ = self.rnn(x)
+        center_out = out[:, self.window_size // 2, :]
+        return self.fc(center_out)
 
-# Training parameters
-gamma = 0.99
-learning_rate = 0.001
-epsilon = 1.0
-epsilon_decay = 0.995
-epsilon_min = 0.01
-batch_size = 32
-memory = []
-mem_size = 10000
+# ------------------------------
+# 3. Training + Validation
+# ------------------------------
+def train_and_validate():
+    # Load dataset
+    data = np.load("channel_dataset.npz")
+    noisy_data = data['noisy']
+    clean_data = data['clean']
 
-def train_dqn():
-    env = WirelessSequenceEnv(sequence_length=5, snr_db=10)
-    state_dim = env.sequence_length
-    action_dim = 2
-    model = DQN(state_dim, action_dim)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Split data
+    X_train_noisy, X_val_noisy, X_train_clean, X_val_clean = train_test_split(
+        noisy_data, clean_data, test_size=0.2, random_state=42
+    )
+
+    train_env = WirelessEnv(X_train_noisy, X_train_clean, window_size=5)
+    val_env = WirelessEnv(X_val_noisy, X_val_clean, window_size=5)
+
+    # Hyperparameters
+    gamma = 0.99
+    lr = 0.001
+    epsilon_start = 1.0
+    epsilon_min = 0.01
+    epsilon_decay = 0.995
+    batch_size = 64
+    memory_size = 10000
+    episodes = 500
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SBRNN(window_size=5).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
-    
-    global epsilon
-    rewards_history = []
-    
-    for episode in range(1000):
-        state = env.reset()
+
+    memory = deque(maxlen=memory_size)
+    epsilon = epsilon_start
+
+    train_rewards = []
+    val_accuracies = []
+    val_episodes = []
+    best_val_acc = 0.0
+
+    for episode in range(episodes):
+        state = train_env.reset()
         done = False
         total_reward = 0
+        correct = 0
+        total = 0
+
         while not done:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
             if random.random() < epsilon:
                 action = random.randint(0, 1)
             else:
                 with torch.no_grad():
-                    action = torch.argmax(model(state_tensor)).item()
-            
-            next_state, reward, done = env.step(action)
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    q_values = model(state_tensor)
+                    action = torch.argmax(q_values).item()
+
+            next_state, reward, done, true_bit = train_env.step(action)
             memory.append((state, action, reward, next_state, done))
-            if len(memory) > mem_size:
-                memory.pop(0)
-            
-            state = next_state
             total_reward += reward
-            
-            if len(memory) > batch_size:
+            correct += (action == true_bit)
+            total += 1
+            state = next_state
+
+            if len(memory) >= batch_size:
                 batch = random.sample(memory, batch_size)
-                states, actions, rewards, next_states, dones = zip(*batch)
-                states = torch.FloatTensor(states)
-                actions = torch.LongTensor(actions).unsqueeze(1)
-                rewards = torch.FloatTensor(rewards).unsqueeze(1)
-                next_states = torch.FloatTensor(next_states)
-                dones = torch.FloatTensor(dones).unsqueeze(1)
-                
-                q_values = model(states).gather(1, actions)
-                next_q_values = model(next_states).max(1, keepdim=True)[0]
-                target_q_values = rewards + gamma * next_q_values * (1 - dones)
-                
-                loss = criterion(q_values, target_q_values.detach())
+                max_len = max(len(x[0]) for x in batch)
+                states = np.array([np.pad(x[0], (0, max_len - len(x[0]))) for x in batch])
+                next_states = np.array([np.pad(x[3], (0, max_len - len(x[3]))) for x in batch])
+                states = torch.FloatTensor(states).to(device)
+                actions = torch.LongTensor([x[1] for x in batch]).to(device)
+                rewards = torch.FloatTensor([x[2] for x in batch]).to(device)
+                next_states = torch.FloatTensor(next_states).to(device)
+                dones = torch.FloatTensor([x[4] for x in batch]).to(device)
+
+                current_q = model(states).gather(1, actions.unsqueeze(1))
+                with torch.no_grad():
+                    next_q = model(next_states).max(1)[0]
+                    targets = rewards + gamma * next_q * (1 - dones)
+
+                loss = criterion(current_q.squeeze(), targets)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-            
+
         epsilon = max(epsilon_min, epsilon * epsilon_decay)
-        rewards_history.append(total_reward)
-        print(f"Episode {episode+1}: Total Reward: {total_reward}")
-    
-    torch.save(model.state_dict(), "dqn_sequence_detector.pth")
-    print("Model saved.")
-    
-    # Plot training reward curve
-    plt.plot(rewards_history)
-    plt.xlabel("Episode")
-    plt.ylabel("Total Reward")
-    plt.title("Training Reward Curve")
+        train_rewards.append(total_reward)
+
+        print(f"Episode {episode+1}/{episodes} | Train Reward: {total_reward} | "
+              f"Train Acc: {correct/total:.2%} | Epsilon: {epsilon:.3f}")
+
+        # Validation
+        if episode % 10 == 0:
+            model.eval()
+            val_correct = 0
+            val_total = 0
+            val_state = val_env.reset()
+            val_done = False
+            predicted_bits = []  # Store predicted bits
+            actual_bits = []    # Store actual bits
+
+            while not val_done:
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(val_state).unsqueeze(0).to(device)
+                    action = torch.argmax(model(state_tensor)).item()
+                val_state, _, val_done, true_bit = val_env.step(action)
+                predicted_bits.append(action)
+                actual_bits.append(true_bit)
+                val_correct += (action == true_bit)
+                val_total += 1
+
+            val_acc = val_correct / val_total
+            val_accuracies.append(val_acc)
+            val_episodes.append(episode)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), "best_sbrnn_qlearning.pth")
+
+            # Plot actual vs predicted bits
+            plot_bit_comparison(np.array(actual_bits), np.array(predicted_bits), n_bits=100)
+
+    # Plot training results
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_rewards)
+    plt.title("Training Rewards")
+    plt.subplot(1, 2, 2)
+    plt.plot(val_episodes, val_accuracies, marker='o')
+    plt.title("Validation Accuracy")
+    plt.ylim(0, 1)
     plt.show()
 
-train_dqn()
+    # Final Evaluation
+    model.load_state_dict(torch.load("best_sbrnn_qlearning.pth"))
+    model.eval()
+    total_correct = 0
+    total_bits = 0
+
+    for seq_idx in range(len(X_val_clean)):
+        val_env.reset(seq_idx=seq_idx)
+        done = False
+        while not done:
+            state = val_env._get_window()
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                action = torch.argmax(model(state_tensor)).item()
+            _, _, done, true_bit = val_env.step(action)
+            total_correct += (action == true_bit)
+            total_bits += 1
+
+    print(f"\nOVERALL VALIDATION ACCURACY: {total_correct / total_bits:.4%}")
+    print(f"BER: {1 - (total_correct / total_bits):.4%}")
+
+def plot_bit_comparison(actual, predicted, n_bits=100):
+    plt.figure(figsize=(15, 5))
+    error_mask = (actual[:n_bits] != predicted[:n_bits])
+
+    for i in np.where(error_mask)[0]:
+        plt.axvspan(i - 0.5, i + 0.5, color='red', alpha=0.3)
+
+    plt.step(np.arange(n_bits), actual[:n_bits], where='post',
+             label='Actual', linewidth=2, color='blue')
+    plt.step(np.arange(n_bits), predicted[:n_bits], where='post',
+             linestyle=':', label='Predicted', linewidth=2, color='orange')
+
+    plt.title(f'Bit Comparison (First {n_bits} Bits)', fontsize=14)
+    plt.xlabel('Bit Position', fontsize=12)
+    plt.ylabel('Bit Value', fontsize=12)
+    plt.yticks([0, 1], ['0', '1'], fontsize=12)
+    plt.xticks(fontsize=12)
+    plt.legend(loc='upper right', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    train_and_validate()
