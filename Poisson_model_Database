@@ -1,0 +1,68 @@
+import numpy as np
+
+def generate_poisson_wireless_dataset(
+    num_samples=100,
+    sequence_length=100,
+    base_rate=5.0,
+    signal_boost=3.0,
+    burst_prob=0.3,
+    burst_strength=6.0,
+    flip_prob=0.05,
+    filename="wireless_dataset.npz"
+):
+
+    clean_sequences = []     # Bit sequence after flipping (channel-affected label)
+    original_sequences = []  # Original bits before flipping (for analysis)
+    noisy_sequences = []     # Poisson observed sequences
+    burst_labels = []        # Whether a burst was added (True/False)
+
+    for _ in range(num_samples):
+        # Step 1: Generate random binary sequence
+        original = np.random.randint(0, 2, sequence_length)
+
+        # Step 2: Flip bits with some probability (non-linear channel effect)
+        flip_mask = np.random.rand(sequence_length) < flip_prob
+        flipped = np.bitwise_xor(original, flip_mask.astype(int))
+
+        # Step 3: Convert to Poisson rate λ
+        rates = base_rate + signal_boost * flipped.astype(float)
+
+        # Step 4: Introduce burst noise
+        if np.random.rand() < burst_prob:
+            burst_start = np.random.randint(0, sequence_length // 2)
+            burst_end = min(burst_start + np.random.randint(5, 20), sequence_length)
+            rates[burst_start:burst_end] += burst_strength
+            burst_applied = True
+        else:
+            burst_applied = False
+
+        # Step 5: Simulate Poisson-distributed received signal
+        received = np.random.poisson(rates)
+
+        # Step 6: Store results
+        clean_sequences.append(flipped)
+        original_sequences.append(original)
+        noisy_sequences.append(received)
+        burst_labels.append(burst_applied)
+
+    # Step 7: Save to disk
+    np.savez(filename,
+             clean=np.array(clean_sequences),
+             original=np.array(original_sequences),
+             noisy=np.array(noisy_sequences),
+             burst=np.array(burst_labels))
+
+    print(f" Poisson channel dataset saved to '{filename}' with {num_samples} samples.")
+
+# Run the generator
+if __name__ == "__main__":
+    generate_poisson_wireless_dataset(
+        num_samples=500,
+        sequence_length=200,
+        base_rate=4.0,
+        signal_boost=5.0,
+        burst_prob=0.25,
+        burst_strength=10.0,
+        flip_prob=0.03,
+        filename="channel_dataset.npz"
+    )
